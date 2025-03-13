@@ -51,7 +51,7 @@ func TestProcessOutputPreservesColors(t *testing.T) {
 	}
 
 	// Check that the prefix is colored with the specified color
-	if !strings.Contains(output, colorGreen+"[test:out]") {
+	if !strings.Contains(output, colorGreen+"[test]") {
 		t.Errorf("processOutput() did not color the prefix, output = %q", output)
 	}
 }

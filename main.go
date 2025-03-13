@@ -437,15 +437,15 @@ func processOutput(pipe io.Reader, tag string, streamType string, color string) 
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Format the prefix with color
-		prefix := fmt.Sprintf("[%s:%s] ", tag, streamType)
-
+		// Format the prefix differently based on color settings
+		var prefix string
 		if noColor || !colorSupported {
-			// No color mode - just print the prefix and the line
+			// When color is disabled, include the stream type in the prefix
+			prefix = fmt.Sprintf("[%s:%s] ", tag, streamType)
 			fmt.Println(prefix + line)
 		} else {
-			// Always print the prefix with our color, then the line as is
-			// This preserves any color codes in the line
+			// When color is enabled, omit the stream type as the color indicates it
+			prefix = fmt.Sprintf("[%s] ", tag)
 			fmt.Print(color + prefix + colorReset + line + "\n")
 		}
 	}
