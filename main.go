@@ -41,6 +41,14 @@ var (
 	activeCommands sync.Map
 	// Force shell usage
 	forceShell bool
+	// Flag to indicate if we're running in parallel mode
+	parallelMode bool
+	// Time of the last SIGINT for double Ctrl+C detection
+	lastSigIntTime time.Time
+	// Currently running command in sequential mode
+	currentSequentialCmd *exec.Cmd
+	// Mutex to protect currentSequentialCmd
+	currentCmdMutex sync.Mutex
 )
 
 // CommandInfo holds information about a command to be executed
@@ -86,8 +94,8 @@ Examples:
 	rootCmd.PersistentFlags().BoolVar(&forceShell, "shell", false, "Force the use of a shell for all commands")
 
 	var parallelCmd = &cobra.Command{
-		Use:     "p",
-		Aliases: []string{"parallel"},
+		Use:     "=",
+		Aliases: []string{"p", "parallel"},
 		Short:   "Run commands in parallel",
 		Long:    `Run multiple commands in parallel and output the results as they come in.`,
 		Args:    cobra.MinimumNArgs(0),
@@ -98,8 +106,8 @@ Examples:
 	}
 
 	var sequentialCmd = &cobra.Command{
-		Use:     "s",
-		Aliases: []string{"sequential"},
+		Use:     "+",
+		Aliases: []string{"s", "sequential"},
 		Short:   "Run commands sequentially",
 		Long:    `Run multiple commands one after another and output the results.`,
 		Args:    cobra.MinimumNArgs(0),
@@ -125,27 +133,60 @@ func setupSignalHandling() {
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	go func() {
-		sig := <-signalChan
-		printColoredMessage(fmt.Sprintf("Received signal: %v. Forwarding to all child processes...", sig), colorYellow)
+		for sig := range signalChan {
+			// Handle SIGINT (Ctrl+C) specially for sequential mode
+			if sig == syscall.SIGINT && !parallelMode {
+				now := time.Now()
 
-		// Forward the signal to all active commands
-		activeCommands.Range(func(key, value interface{}) bool {
-			cmd := value.(*exec.Cmd)
-			if cmd.Process != nil {
-				// On Windows, not all signals are supported
-				if runtime.GOOS == "windows" && (sig == syscall.SIGHUP) {
-					// For unsupported signals on Windows, just kill the process
-					_ = cmd.Process.Kill()
-				} else {
-					_ = cmd.Process.Signal(sig)
+				// Check if this is a double Ctrl+C (within 1 second)
+				if !lastSigIntTime.IsZero() && now.Sub(lastSigIntTime) < time.Second {
+					// Double Ctrl+C detected, exit rufl
+					printColoredMessage("Double Ctrl+C detected. Exiting...", colorYellow)
+					os.Exit(130) // 128 + SIGINT (2)
 				}
-			}
-			return true
-		})
 
-		// For SIGINT and SIGTERM, exit after forwarding
-		if sig == syscall.SIGINT || sig == syscall.SIGTERM {
-			os.Exit(128 + int(sig.(syscall.Signal)))
+				// Single Ctrl+C, just interrupt the current command
+				lastSigIntTime = now
+				printColoredMessage("Interrupting current command. Press Ctrl+C again within 1 second to exit rufl.", colorYellow)
+
+				// Forward the signal to the current command only
+				currentCmdMutex.Lock()
+				if currentSequentialCmd != nil && currentSequentialCmd.Process != nil {
+					_ = currentSequentialCmd.Process.Signal(sig)
+				}
+				currentCmdMutex.Unlock()
+
+				// Continue the loop to handle more signals
+				continue
+			}
+
+			// For other signals or parallel mode, use the original behavior
+			printColoredMessage(fmt.Sprintf("Received signal: %v. Forwarding to all child processes...", sig), colorYellow)
+
+			// Forward the signal to all active commands
+			activeCommands.Range(func(key, value interface{}) bool {
+				cmd := value.(*exec.Cmd)
+				if cmd.Process != nil {
+					// On Windows, not all signals are supported
+					if runtime.GOOS == "windows" && (sig == syscall.SIGHUP) {
+						// For unsupported signals on Windows, just kill the process
+						_ = cmd.Process.Kill()
+					} else {
+						_ = cmd.Process.Signal(sig)
+					}
+				}
+				return true
+			})
+
+			// For SIGINT and SIGTERM, exit after forwarding
+			if (sig == syscall.SIGINT || sig == syscall.SIGTERM) && parallelMode {
+				os.Exit(128 + int(sig.(syscall.Signal)))
+			}
+
+			// For SIGTERM in sequential mode, also exit
+			if sig == syscall.SIGTERM && !parallelMode {
+				os.Exit(128 + int(sig.(syscall.Signal)))
+			}
 		}
 	}()
 }
@@ -242,6 +283,7 @@ func processCommands(args []string) []CommandInfo {
 
 // runCommands executes the given commands either in parallel or sequentially
 func runCommands(commands []CommandInfo, parallel bool) {
+	parallelMode = parallel
 	if parallel {
 		runParallel(commands)
 	} else {
@@ -355,6 +397,13 @@ func executeCommand(cmdInfo CommandInfo) {
 		printColoredMessage(fmt.Sprintf("[%s] Executing directly: %s", cmdInfo.Tag, cmdInfo.Command), colorCyan)
 	}
 
+	// If in sequential mode, set this as the current command
+	if !parallelMode {
+		currentCmdMutex.Lock()
+		currentSequentialCmd = cmd
+		currentCmdMutex.Unlock()
+	}
+
 	// Inherit environment variables from the parent process
 	env := os.Environ()
 
@@ -417,6 +466,13 @@ func executeCommand(cmdInfo CommandInfo) {
 
 	// Remove the command from the active commands map
 	activeCommands.Delete(cmdID)
+
+	// If in sequential mode, clear the current command
+	if !parallelMode {
+		currentCmdMutex.Lock()
+		currentSequentialCmd = nil
+		currentCmdMutex.Unlock()
+	}
 
 	if err != nil {
 		// Check if it's an exit error
